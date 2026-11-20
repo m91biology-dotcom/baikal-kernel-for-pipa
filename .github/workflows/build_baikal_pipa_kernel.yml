@@ -58,11 +58,7 @@ jobs:
           mkdir -p toolchain
           CLANG_URL=""
 
-          # ۱. جستجوی خودکار فایل لینک در مخزن ZyCromerZ/Clang بدون وابستگی به نام دقیق
           if git clone --depth=1 https://github.com/ZyCromerZ/Clang.git /tmp/zyc_links 2>/dev/null; then
-            echo "=== Available link files in ZyCromerZ/Clang ==="
-            find /tmp/zyc_links -maxdepth 2 -iname "*link*.txt" | sort || true
-
             LINK_FILE=$(find /tmp/zyc_links -maxdepth 2 -iname "*clang*${CLANG_VER}*link*.txt" | sort -V | tail -n 1 || true)
             if [ -z "$LINK_FILE" ]; then
               LINK_FILE=$(find /tmp/zyc_links -maxdepth 2 -iname "*clang*link*.txt" | sort -V | tail -n 1 || true)
@@ -74,7 +70,6 @@ jobs:
             rm -rf /tmp/zyc_links
           fi
 
-          # ۲. در صورت نبود فایل متنی، دریافت مستقیم جدیدترین نسخه از بخش Releases گیت‌هاب ZyCromerZ
           if [ -z "$CLANG_URL" ] || ! echo "$CLANG_URL" | grep -q "^http"; then
             CLANG_URL=$(python3 - << 'PYEOF'
           import json, os, sys, urllib.request
@@ -104,7 +99,6 @@ jobs:
             )
           fi
 
-          # ۳. دانلود و استخراج کامپایلر
           DOWNLOAD_OK=0
           if [ -n "$CLANG_URL" ] && echo "$CLANG_URL" | grep -q "^http"; then
             echo "Downloading Clang from: $CLANG_URL"
@@ -121,7 +115,6 @@ jobs:
             fi
           fi
 
-          # ۴. کامپایلر پشتیبان خودکار در صورت عدم دسترسی به سرور دانلود
           if [ "$DOWNLOAD_OK" -ne 1 ]; then
             echo "[*] Falling back to LineageOS prebuilt AOSP Clang..."
             rm -rf toolchain/*
@@ -137,7 +130,6 @@ jobs:
           python3 - << 'PYEOF'
           import os, re, sys, textwrap
 
-          # ۱. افزودن گره /sys/power/keep_awake در kernel/power/main.c
           pm_main = "kernel/power/main.c"
           pm_hdr = "include/linux/pm_wakeup.h"
           if not os.path.exists(pm_main):
@@ -156,7 +148,7 @@ jobs:
               patch_code = textwrap.dedent(f"""
               {inc_block}
               #ifdef CONFIG_PM_SLEEP
-              static struct wakeup_source *baikal_keep_awake_ws;
+              static struct wakeup_source *baikal_keep_awakews;
               static int baikal_keep_awake_state;
 
               static ssize_t keep_awake_show(struct kobject *kobj,
@@ -174,16 +166,16 @@ jobs:
                   if (kstrtoint(buf, 10, &val))
                       return -EINVAL;
 
-                  if (!baikal_keep_awake_ws)
-                      baikal_keep_awake_ws = {ws_reg_call};
+                  if (!baikal_keep_awakews)
+                      baikal_keep_awakews = {ws_reg_call};
 
                   if (val > 0 && !baikal_keep_awake_state) {{
-                      if (baikal_keep_awake_ws)
-                          __pm_stay_awake(baikal_keep_awake_ws);
+                      if (baikal_keep_awakews)
+                          __pm_stay_awake(baikal_keep_awakews);
                       baikal_keep_awake_state = 1;
                   }} else if (val <= 0 && baikal_keep_awake_state) {{
-                      if (baikal_keep_awake_ws)
-                          __pm_relax(baikal_keep_awake_ws);
+                      if (baikal_keep_awakews)
+                          __pm_relax(baikal_keep_awakews);
                       baikal_keep_awake_state = 0;
                   }}
                   return n;
@@ -206,7 +198,6 @@ jobs:
           else:
               print("[*] keep_awake already exists in kernel/power/main.c (skipping)")
 
-          # ۲. افزودن ماژول داخلی /sys/module/baikalfs در drivers/misc/baikalfs.c
           bfs_c = "drivers/misc/baikalfs.c"
           if not os.path.exists(bfs_c):
               with open(bfs_c, "w", encoding="utf-8") as f:
@@ -234,6 +225,51 @@ jobs:
                   f.write("\nobj-y += baikalfs.o\n")
           print("[+] Ensured built-in /sys/module/baikalfs module")
           PYEOF
+
+      - name: Disable Unsupported MLGO Flags (regalloc-enable-advisor)
+        run: |
+          python3 - << 'PYEOF'
+          import os, re
+
+          def patch_text(txt):
+              new_txt = re.sub(r'regalloc-enable-advisor=(release|development)', 'regalloc-enable-advisor=default', txt)
+              new_txt = re.sub(r'-Wl,-mllvm,-enable-ml-inliner=(release|development)', '', new_txt)
+              new_txt = re.sub(r'-mllvm\s+-enable-ml-inliner=(release|development)', '', new_txt)
+              return new_txt
+
+          patched = 0
+          for root_dir in ("kernel", "toolchain"):
+              if not os.path.isdir(root_dir):
+                  continue
+              for dp, dns, fns in os.walk(root_dir):
+                  dns[:] = [d for d in dns if d not in (".git", "out")]
+                  for fn in fns:
+                      if root_dir == "kernel":
+                          if not (fn == "Makefile" or fn == "Kbuild" or fn.startswith(("Makefile.", "build.config")) or fn.endswith((".mk", ".sh"))):
+                              continue
+                      else:
+                          if not (fn.endswith(".cfg") or fn in ("clang", "clang++")):
+                              continue
+                      fp = os.path.join(dp, fn)
+                      try:
+                          if os.path.getsize(fp) > 2 * 1024 * 1024:
+                              continue
+                          raw = open(fp, "rb").read()
+                          if b"regalloc-enable-advisor" not in raw and b"enable-ml-inliner" not in raw:
+                              continue
+                          if b"\x00" in raw:
+                              continue
+                          txt = raw.decode("utf-8", errors="ignore")
+                          new_txt = patch_text(txt)
+                          if new_txt != txt:
+                              open(fp, "w", encoding="utf-8").write(new_txt)
+                              print(f"[+] Patched MLGO flags in: {fp}")
+                              patched += 1
+                      except Exception as e:
+                          print(f"[!] Skipped {fp}: {e}")
+          print(f"[*] Total MLGO files patched: {patched}")
+          PYEOF
+          grep -rn "regalloc-enable-advisor" kernel/Makefile kernel/arch/arm64/Makefile kernel/scripts/ toolchain/bin/*.cfg 2>/dev/null || true
 
       - name: Configure and Compile Kernel
         working-directory: kernel
@@ -294,13 +330,11 @@ jobs:
             fi
           fi
 
-          # تنظیم نسخه و فعال‌سازی قطعی core_ctl برای BaikalOS
           ./scripts/config --file out/.config --set-str CONFIG_LOCALVERSION "-n0-BaikalOS-pipa"
           ./scripts/config --file out/.config --enable CONFIG_SCHED_CORE_CTL
           ./scripts/config --file out/.config --disable CONFIG_LOCALVERSION_AUTO
           make "${MAKE_ARGS[@]}" olddefconfig
 
-          # کامپایل هسته و DTBها
           make -j"$(nproc)" "${MAKE_ARGS[@]}" Image dtbs
 
           echo "=== Verifying Build Outputs ==="

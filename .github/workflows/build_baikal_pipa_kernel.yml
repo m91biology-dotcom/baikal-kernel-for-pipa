@@ -1,0 +1,297 @@
+name: Build n0_kernel_pipa for BaikalOS (Pad 6)
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_repo:
+        description: 'آدرس مخزن سورس کرنل'
+        required: true
+        default: 'https://github.com/CuriousNom/n0_kernel_pipa'
+      kernel_branch:
+        description: 'نام شاخه (خالی = شاخه پیش‌فرض مخزن؛ در صورت وجود شاخه AOSP نام آن را بنویسید)'
+        required: false
+        default: ''
+      custom_defconfig:
+        description: 'نام دستی defconfig (خالی = تشخیص خودکار pipa)'
+        required: false
+        default: ''
+      clang_version:
+        description: 'نسخه کامپایلر ZyCromerZ Clang'
+        type: choice
+        default: '18'
+        options:
+          - '18'
+          - '14'
+          - '19'
+      apply_baikal_patches:
+        description: 'تزریق خودکار پچ‌های BaikalOS (keep_awake و baikalfs)'
+        type: boolean
+        default: true
+
+jobs:
+  build_kernel:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Install Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison build-essential ccache cpio curl flex git \
+            kmod libelf-dev libssl-dev lld llvm python3 python-is-python3 wget zip
+
+      - name: Clone n0_kernel_pipa Source
+        run: |
+          if [ -n "${{ inputs.kernel_branch }}" ]; then
+            git clone --depth=1 -b "${{ inputs.kernel_branch }}" "${{ inputs.kernel_repo }}" kernel
+          else
+            git clone --depth=1 "${{ inputs.kernel_repo }}" kernel
+          fi
+          git -C kernel submodule update --init --recursive --depth=1 || true
+          echo "=== Cloned Branch & Last Commit ==="
+          git -C kernel log -n 1 --oneline
+
+      - name: Download ZyCromerZ Clang Toolchain
+        run: |
+          mkdir -p toolchain
+          CLANG_VER="${{ inputs.clang_version }}"
+          CLANG_URL=$(curl -sL "https://raw.githubusercontent.com/ZyCromerZ/Clang/main/Clang-${CLANG_VER}-link.txt" | head -n 1 | tr -d '\r\n')
+          echo "Downloading Clang ${CLANG_VER}: $CLANG_URL"
+          if [ -z "$CLANG_URL" ] || ! echo "$CLANG_URL" | grep -q "^http"; then
+            echo "[!] Failed to fetch Clang-${CLANG_VER} download URL!"
+            exit 1
+          fi
+          curl -L "$CLANG_URL" -o clang.tar.gz
+          tar -xzf clang.tar.gz -C toolchain
+          rm -f clang.tar.gz
+          ./toolchain/bin/clang --version
+
+      - name: Apply BaikalOS Kernel Patches (keep_awake & baikalfs)
+        if: ${{ inputs.apply_baikal_patches }}
+        working-directory: kernel
+        run: |
+          python3 - << 'PYEOF'
+          import os, re, sys, textwrap
+
+          # ۱. افزودن گره /sys/power/keep_awake در kernel/power/main.c
+          pm_main = "kernel/power/main.c"
+          pm_hdr = "include/linux/pm_wakeup.h"
+          if not os.path.exists(pm_main):
+              print("[!] kernel/power/main.c not found!")
+              sys.exit(1)
+
+          hdr_txt = open(pm_hdr, "r", encoding="utf-8", errors="ignore").read() if os.path.exists(pm_hdr) else ""
+          if re.search(r"wakeup_source_register\s*\(\s*struct\s+device", hdr_txt):
+              ws_reg_call = 'wakeup_source_register(NULL, "baikal_keep_awake")'
+          else:
+              ws_reg_call = 'wakeup_source_register("baikal_keep_awake")'
+
+          txt = open(pm_main, "r", encoding="utf-8", errors="ignore").read()
+          if "keep_awake_store" not in txt and "power_attr(keep_awake)" not in txt:
+              inc_block = "#include <linux/pm_wakeup.h>\n" if "pm_wakeup.h" not in txt else ""
+              patch_code = textwrap.dedent(f"""
+              {inc_block}
+              #ifdef CONFIG_PM_SLEEP
+              static struct wakeup_source *baikal_keep_awake_ws;
+              static int baikal_keep_awake_state;
+
+              static ssize_t keep_awake_show(struct kobject *kobj,
+                                             struct kobj_attribute *attr, char *buf)
+              {{
+                  return sprintf(buf, "%d\\n", baikal_keep_awake_state);
+              }}
+
+              static ssize_t keep_awake_store(struct kobject *kobj,
+                                              struct kobj_attribute *attr,
+                                              const char *buf, size_t n)
+              {{
+                  int val = 0;
+
+                  if (kstrtoint(buf, 10, &val))
+                      return -EINVAL;
+
+                  if (!baikal_keep_awake_ws)
+                      baikal_keep_awake_ws = {ws_reg_call};
+
+                  if (val > 0 && !baikal_keep_awake_state) {{
+                      if (baikal_keep_awake_ws)
+                          __pm_stay_awake(baikal_keep_awake_ws);
+                      baikal_keep_awake_state = 1;
+                  }} else if (val <= 0 && baikal_keep_awake_state) {{
+                      if (baikal_keep_awake_ws)
+                          __pm_relax(baikal_keep_awake_ws);
+                      baikal_keep_awake_state = 0;
+                  }}
+                  return n;
+              }}
+
+              power_attr(keep_awake);
+              #endif
+              """)
+              m = re.search(r"(static\s+struct\s+attribute\s*\*\s*g\[\]\s*=\s*\{)", txt)
+              if not m:
+                  print("[!] Could not locate attribute group g[] in kernel/power/main.c")
+                  sys.exit(1)
+              pos = m.start()
+              end_hdr = m.end()
+              attr_entry = "\n#ifdef CONFIG_PM_SLEEP\n\t&keep_awake_attr.attr,\n#endif"
+              txt = txt[:pos] + patch_code + "\n" + txt[pos:end_hdr] + attr_entry + txt[end_hdr:]
+              with open(pm_main, "w", encoding="utf-8") as f:
+                  f.write(txt)
+              print("[+] Patched kernel/power/main.c with /sys/power/keep_awake")
+          else:
+              print("[*] keep_awake already exists in kernel/power/main.c (skipping)")
+
+          # ۲. افزودن ماژول داخلی /sys/module/baikalfs در drivers/misc/baikalfs.c
+          bfs_c = "drivers/misc/baikalfs.c"
+          if not os.path.exists(bfs_c):
+              with open(bfs_c, "w", encoding="utf-8") as f:
+                  f.write(textwrap.dedent("""\
+                  #include <linux/module.h>
+                  #include <linux/kernel.h>
+                  #include <linux/init.h>
+
+                  static int enabled = 1;
+                  module_param(enabled, int, 0644);
+                  MODULE_PARM_DESC(enabled, "BaikalOS kernel compatibility module");
+
+                  static int __init baikalfs_init(void)
+                  {
+                      pr_info("baikalfs: initialized for Xiaomi Pad 6 (pipa)\\n");
+                      return 0;
+                  }
+                  late_initcall(baikalfs_init);
+                  """))
+
+          mk_path = "drivers/misc/Makefile"
+          mk_txt = open(mk_path, "r", encoding="utf-8", errors="ignore").read()
+          if "baikalfs.o" not in mk_txt:
+              with open(mk_path, "a", encoding="utf-8") as f:
+                  f.write("\nobj-y += baikalfs.o\n")
+          print("[+] Ensured built-in /sys/module/baikalfs module")
+          PYEOF
+
+      - name: Configure and Compile Kernel
+        working-directory: kernel
+        run: |
+          export PATH="$GITHUB_WORKSPACE/toolchain/bin:$PATH"
+          export ARCH=arm64
+          export SUBARCH=arm64
+
+          MAKE_ARGS=(
+            O=out
+            ARCH=arm64
+            CC=clang
+            CLANG_TRIPLE=aarch64-linux-gnu-
+            CROSS_COMPILE=aarch64-linux-gnu-
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+            LLVM=1
+            LLVM_IAS=1
+            LD=ld.lld
+            AR=llvm-ar
+            NM=llvm-nm
+            OBJCOPY=llvm-objcopy
+            OBJDUMP=llvm-objdump
+            STRIP=llvm-strip
+          )
+
+          echo "=== Available pipa / kona configs in repository ==="
+          find arch/arm64/configs -maxdepth 3 \( -iname "*pipa*" -o -iname "*kona*" \) | sort
+
+          if [ -n "${{ inputs.custom_defconfig }}" ]; then
+            echo "Using custom defconfig: ${{ inputs.custom_defconfig }}"
+            make "${MAKE_ARGS[@]}" "${{ inputs.custom_defconfig }}"
+          elif [ -f arch/arm64/configs/vendor/pipa_defconfig ]; then
+            echo "Using vendor/pipa_defconfig"
+            make "${MAKE_ARGS[@]}" vendor/pipa_defconfig
+          elif [ -f arch/arm64/configs/pipa_defconfig ]; then
+            echo "Using pipa_defconfig"
+            make "${MAKE_ARGS[@]}" pipa_defconfig
+          elif [ -f arch/arm64/configs/vendor/xiaomi/pipa.config ]; then
+            echo "Using vendor/xiaomi/pipa.config fragment"
+            if [ -f arch/arm64/configs/vendor/kona-perf_defconfig ]; then
+              make "${MAKE_ARGS[@]}" vendor/kona-perf_defconfig
+            else
+              make "${MAKE_ARGS[@]}" kona-perf_defconfig
+            fi
+            FRAGMENTS="arch/arm64/configs/vendor/xiaomi/pipa.config"
+            if [ -f arch/arm64/configs/vendor/xiaomi/sm8250-common.config ]; then
+              FRAGMENTS="arch/arm64/configs/vendor/xiaomi/sm8250-common.config $FRAGMENTS"
+            fi
+            ./scripts/kconfig/merge_config.sh -m -O out out/.config $FRAGMENTS
+          else
+            AUTO_CFG=$(find arch/arm64/configs -maxdepth 3 -iname "*pipa*defconfig*" | head -n 1 | sed 's|^arch/arm64/configs/||')
+            if [ -n "$AUTO_CFG" ]; then
+              echo "Auto-detected defconfig: $AUTO_CFG"
+              make "${MAKE_ARGS[@]}" "$AUTO_CFG"
+            else
+              echo "[!] Could not auto-detect pipa defconfig. Check the list above and set custom_defconfig."
+              exit 1
+            fi
+          fi
+
+          # تنظیم نسخه و فعال‌سازی قطعی core_ctl برای BaikalOS
+          ./scripts/config --file out/.config --set-str CONFIG_LOCALVERSION "-n0-BaikalOS-pipa"
+          ./scripts/config --file out/.config --enable CONFIG_SCHED_CORE_CTL
+          ./scripts/config --file out/.config --disable CONFIG_LOCALVERSION_AUTO
+          make "${MAKE_ARGS[@]}" olddefconfig
+
+          # کامپایل هسته و DTBها
+          make -j"$(nproc)" "${MAKE_ARGS[@]}" Image dtbs
+
+          echo "=== Verifying Build Outputs ==="
+          ls -lh out/arch/arm64/boot/Image
+
+      - name: Package AnyKernel3 Flashable ZIP & Raw Artifacts
+        run: |
+          mkdir -p release_out
+          cp kernel/out/arch/arm64/boot/Image release_out/
+
+          DTBS=$(find kernel/out/arch/arm64/boot/dts -name "kona*.dtb" | sort)
+          if [ -n "$DTBS" ]; then
+            cat $DTBS > release_out/dtb
+          fi
+          if [ -f kernel/out/arch/arm64/boot/dtbo.img ]; then
+            cp kernel/out/arch/arm64/boot/dtbo.img release_out/
+          fi
+
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git anykernel
+          rm -rf anykernel/.git anykernel/README.md anykernel/modules anykernel/patch anykernel/ramdisk
+
+          cat << 'EOF' > anykernel/anykernel.sh
+          ### AnyKernel3 Ramdisk Mod Script
+          properties() { '
+          kernel.string=n0_kernel_pipa (BaikalOS Edition) for Xiaomi Pad 6
+          do.devicecheck=0
+          do.modules=0
+          do.systemless=1
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=pipa
+          device.name2=redwood
+          supported.versions=13 - 15
+          supported.patchlevels=
+          '; }
+
+          block=/dev/block/bootdevice/by-name/boot;
+          is_slot_device=1;
+          ramdisk_compression=auto;
+          patch_vbmeta_flag=auto;
+
+          . tools/ak3-core.sh;
+
+          split_boot;
+          flash_boot;
+          EOF
+
+          cp release_out/Image anykernel/
+          [ -f release_out/dtb ] && cp release_out/dtb anykernel/
+
+          BUILD_DATE=$(date +%Y%m%d-%H%M)
+          (cd anykernel && zip -r9 "../release_out/AnyKernel3-n0-BaikalOS-pipa-${BUILD_DATE}.zip" .)
+          ls -lh release_out/
+
+      - name: Upload Kernel Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: n0-BaikalOS-Kernel-pipa
+          path: release_out/*
+          retention-days: 14

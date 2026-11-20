@@ -8,7 +8,7 @@ on:
         required: true
         default: 'https://github.com/CuriousNom/n0_kernel_pipa'
       kernel_branch:
-        description: 'نام شاخه (خالی = شاخه پیش‌فرض مخزن؛ در صورت وجود شاخه AOSP نام آن را بنویسید)'
+        description: 'نام شاخه (خالی = شاخه پیش‌فرض مخزن)'
         required: false
         default: ''
       custom_defconfig:
@@ -16,13 +16,14 @@ on:
         required: false
         default: ''
       clang_version:
-        description: 'نسخه کامپایلر ZyCromerZ Clang'
+        description: 'نسخه پیشنهادی ZyCromerZ Clang'
         type: choice
         default: '18'
         options:
           - '18'
-          - '14'
           - '19'
+          - '20'
+          - '14'
       apply_baikal_patches:
         description: 'تزریق خودکار پچ‌های BaikalOS (keep_awake و baikalfs)'
         type: boolean
@@ -36,7 +37,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y bc bison build-essential ccache cpio curl flex git \
-            kmod libelf-dev libssl-dev lld llvm python3 python-is-python3 wget zip
+            kmod libelf-dev libssl-dev lld llvm python3 python-is-python3 wget zip \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi
 
       - name: Clone n0_kernel_pipa Source
         run: |
@@ -50,18 +52,82 @@ jobs:
           git -C kernel log -n 1 --oneline
 
       - name: Download ZyCromerZ Clang Toolchain
+        env:
+          CLANG_VER: ${{ inputs.clang_version }}
         run: |
           mkdir -p toolchain
-          CLANG_VER="${{ inputs.clang_version }}"
-          CLANG_URL=$(curl -sL "https://raw.githubusercontent.com/ZyCromerZ/Clang/main/Clang-${CLANG_VER}-link.txt" | head -n 1 | tr -d '\r\n')
-          echo "Downloading Clang ${CLANG_VER}: $CLANG_URL"
-          if [ -z "$CLANG_URL" ] || ! echo "$CLANG_URL" | grep -q "^http"; then
-            echo "[!] Failed to fetch Clang-${CLANG_VER} download URL!"
-            exit 1
+          CLANG_URL=""
+
+          # ۱. جستجوی خودکار فایل لینک در مخزن ZyCromerZ/Clang بدون وابستگی به نام دقیق
+          if git clone --depth=1 https://github.com/ZyCromerZ/Clang.git /tmp/zyc_links 2>/dev/null; then
+            echo "=== Available link files in ZyCromerZ/Clang ==="
+            find /tmp/zyc_links -maxdepth 2 -iname "*link*.txt" | sort || true
+
+            LINK_FILE=$(find /tmp/zyc_links -maxdepth 2 -iname "*clang*${CLANG_VER}*link*.txt" | sort -V | tail -n 1 || true)
+            if [ -z "$LINK_FILE" ]; then
+              LINK_FILE=$(find /tmp/zyc_links -maxdepth 2 -iname "*clang*link*.txt" | sort -V | tail -n 1 || true)
+            fi
+            if [ -n "$LINK_FILE" ] && [ -f "$LINK_FILE" ]; then
+              echo "Selected link file: $LINK_FILE"
+              CLANG_URL=$(head -n 1 "$LINK_FILE" | tr -d '\r\n')
+            fi
+            rm -rf /tmp/zyc_links
           fi
-          curl -L "$CLANG_URL" -o clang.tar.gz
-          tar -xzf clang.tar.gz -C toolchain
-          rm -f clang.tar.gz
+
+          # ۲. در صورت نبود فایل متنی، دریافت مستقیم جدیدترین نسخه از بخش Releases گیت‌هاب ZyCromerZ
+          if [ -z "$CLANG_URL" ] || ! echo "$CLANG_URL" | grep -q "^http"; then
+            CLANG_URL=$(python3 - << 'PYEOF'
+          import json, os, sys, urllib.request
+          ver = os.environ.get("CLANG_VER", "18")
+          try:
+              req = urllib.request.Request(
+                  "https://api.github.com/repos/ZyCromerZ/Clang/releases?per_page=20",
+                  headers={"User-Agent": "github-actions"}
+              )
+              with urllib.request.urlopen(req, timeout=20) as r:
+                  rels = json.loads(r.read().decode("utf-8", errors="ignore"))
+              urls = []
+              for rel in rels:
+                  for a in rel.get("assets", []):
+                      u = a.get("browser_download_url", "")
+                      if u.endswith((".tar.gz", ".tar.xz")):
+                          urls.append(u)
+              for u in urls:
+                  if f"Clang-{ver}" in u or f"clang-{ver}" in u:
+                      print(u)
+                      sys.exit(0)
+              if urls:
+                  print(urls[0])
+          except Exception as e:
+              sys.stderr.write(f"Release lookup note: {e}\n")
+          PYEOF
+            )
+          fi
+
+          # ۳. دانلود و استخراج کامپایلر
+          DOWNLOAD_OK=0
+          if [ -n "$CLANG_URL" ] && echo "$CLANG_URL" | grep -q "^http"; then
+            echo "Downloading Clang from: $CLANG_URL"
+            if curl -fL --retry 3 "$CLANG_URL" -o clang.archive && tar -xf clang.archive -C toolchain; then
+              rm -f clang.archive
+              if [ ! -x toolchain/bin/clang ]; then
+                FOUND_CLANG=$(find toolchain -maxdepth 3 -type f -path "*/bin/clang" | head -n 1 || true)
+                if [ -n "$FOUND_CLANG" ]; then
+                  CLANG_DIR=$(dirname "$(dirname "$FOUND_CLANG")")
+                  cp -a "$CLANG_DIR"/. toolchain/
+                fi
+              fi
+              [ -x toolchain/bin/clang ] && DOWNLOAD_OK=1
+            fi
+          fi
+
+          # ۴. کامپایلر پشتیبان خودکار در صورت عدم دسترسی به سرور دانلود
+          if [ "$DOWNLOAD_OK" -ne 1 ]; then
+            echo "[*] Falling back to LineageOS prebuilt AOSP Clang..."
+            rm -rf toolchain/*
+            git clone --depth=1 https://github.com/LineageOS/android_prebuilts_clang_kernel_linux-x86_clang-r416183b.git toolchain
+          fi
+
           ./toolchain/bin/clang --version
 
       - name: Apply BaikalOS Kernel Patches (keep_awake & baikalfs)
